@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="200" height="200" src="../src/resource/icon/icon.png">
+  <img width="200" height="200" src="./src/resource/icon/icon.png">
 
 # HA525
 
