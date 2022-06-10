@@ -15,6 +15,6 @@ make
 
 ## Collaborators
 
-| <img src="https://avatars.githubusercontent.com/u/69493518?v=4" alt="img" style="zoom:10%;" /> | <img src="https://avatars.githubusercontent.com/u/69347961?v=4" alt="img" style="zoom:10%;" /> |
-| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| [sangjun7997](https://github.com/sangjun7997)                                                  | [kka-na](https://github.com/kka-na)                                                            |
+| <img width = "200" height="200" src="https://avatars.githubusercontent.com/u/69493518?v=4" alt="img" /> | <img src="https://avatars.githubusercontent.com/u/69347961?v=4" alt="img" /> |
+| ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| [sangjun7997](https://github.com/sangjun7997)                                                           | [kka-na](https://github.com/kka-na)                                          |
