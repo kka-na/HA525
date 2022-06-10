@@ -1,15 +1,13 @@
 #include "laneDetection.h"
 
 #include <iostream>
-#include <stdlib.h>
-#include <unistd.h>
-#include <algorithm>
 
 #include <opencv2/imgproc.hpp>
 
-#include <QFile>
-#include <QDir>
-#include <QTextStream>
+#include </usr/local/cuda-11.4/include/cuda_runtime.h>
+#include </usr/local/cuda-11.4/include/device_launch_parameters.h>
+
+#include <omp.h>
 
 using namespace cv;
 using namespace std;
@@ -72,22 +70,24 @@ void LaneDetection::startDetection()
         // some processing
         birdEyeView = BirdEyeViewTransform(frame); // 1
         emitProcesses(birdEyeView, s, 1);
+
         scharrFiltered = ScharrFilter(birdEyeView); // 2
         emitProcesses(scharrFiltered, s, 2);
+
         colorFiltered = ColorFilter(birdEyeView); // 3
         emitProcesses(colorFiltered, s, 3);
+
         filtered = addFrame(scharrFiltered, colorFiltered); // 4
         emitProcesses(filtered, s, 4);
+
         laneSearched = SlidingWindow(filtered); // 5
-        // imshow("laneSearched", laneSearched);
         emitProcesses(laneSearched, s, 5);
+
         laneMask = InvBirdEyeViewTransform(laneSearched); // 6
-        // imshow("laneMask", laneMask);
         emitProcesses(laneMask, s, 6);
+
         final = maskingLane(frame, laneMask); // 7
-        // imshow("final", final);
         emitProcesses(final, s, 7);
-        // waitKey(sleep_cnt);
 
         s = std::chrono::high_resolution_clock::now();
 
@@ -284,32 +284,51 @@ Mat LaneDetection::ColorFilter(Mat src)
 {
     int width = src.cols;
     int height = src.rows;
+    int channel = src.channels();
     Mat src_hsv;
-    Mat dst = Mat::zeros(height, width, 0);
     cvtColor(src, src_hsv, COLOR_BGR2HSV);
 
-    // Pixel by Pixel Color Filtering
-    for (int h = 0; h < height; h++)
+    Mat dst;
+    if (with_cuda) // gpu processing
     {
-        Vec3b *ptr = src_hsv.ptr<Vec3b>(h);
-        uchar *dstPtr = dst.ptr<uchar>(h);
-
-        for (int w = 0; w < width; w++)
+        uchar *pDst = new uchar[width * height];
+        uchar *pcuSrc;
+        uchar *pcuDst;
+        (cudaMalloc((void **)&pcuSrc, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuDst, width * height * sizeof(uchar)));
+        (cudaMemcpy(pcuSrc, src_hsv.data, width * height * channel * sizeof(uchar), cudaMemcpyHostToDevice));
+        gpu_ColorFilter(pcuSrc, pcuDst, width, height, channel);
+        (cudaMemcpy(pDst, pcuDst, width * height * sizeof(uchar), cudaMemcpyDeviceToHost));
+        dst = Mat(height, width, CV_8UC1, pDst);
+        cudaFree(pcuSrc);
+        cudaFree(pcuDst);
+    }
+    else // serial processing
+    {
+        dst = Mat::zeros(height, width, 0);
+        // Pixel by Pixel Color Filtering
+        for (int h = 0; h < height; h++)
         {
+            Vec3b *ptr = src_hsv.ptr<Vec3b>(h);
+            uchar *dstPtr = dst.ptr<uchar>(h);
 
-            // Yellow Color Filtering
-            if (lower_yellow[0] <= ptr[w][0] && ptr[w][0] <= upper_yellow[0] && lower_yellow[1] <= ptr[w][1] && ptr[w][1] <= upper_yellow[1] && lower_yellow[2] <= ptr[w][2] && ptr[w][2] <= upper_yellow[2])
+            for (int w = 0; w < width; w++)
             {
-                dstPtr[w] = 255;
-            }
-            // White Color Filtering
-            else if (lower_white[0] <= ptr[w][0] && ptr[w][0] <= upper_white[0] && lower_white[1] <= ptr[w][1] && ptr[w][1] <= upper_white[1] && lower_white[2] <= ptr[w][2] && ptr[w][2] <= upper_white[2])
-            {
-                dstPtr[w] = 255;
-            }
-            else
-            {
-                dstPtr[w] = 0;
+
+                // Yellow Color Filtering
+                if (lower_yellow[0] <= ptr[w][0] && ptr[w][0] <= upper_yellow[0] && lower_yellow[1] <= ptr[w][1] && ptr[w][1] <= upper_yellow[1] && lower_yellow[2] <= ptr[w][2] && ptr[w][2] <= upper_yellow[2])
+                {
+                    dstPtr[w] = 255;
+                }
+                // White Color Filtering
+                else if (lower_white[0] <= ptr[w][0] && ptr[w][0] <= upper_white[0] && lower_white[1] <= ptr[w][1] && ptr[w][1] <= upper_white[1] && lower_white[2] <= ptr[w][2] && ptr[w][2] <= upper_white[2])
+                {
+                    dstPtr[w] = 255;
+                }
+                else
+                {
+                    dstPtr[w] = 0;
+                }
             }
         }
     }
@@ -322,20 +341,47 @@ Mat LaneDetection::addFrame(Mat src1, Mat src2)
 {
     int width = src1.cols;
     int height = src1.rows;
-    Mat dst = Mat::zeros(height, width, 0);
+    Mat dst;
 
-    // add task Pixel by Pixel
-    for (int h = 0; h < height; h++)
+    if (with_cuda)
     {
-        uchar *src1Ptr = src1.ptr<uchar>(h);
-        uchar *src2Ptr = src2.ptr<uchar>(h);
-        uchar *dstPtr = dst.ptr<uchar>(h);
-        for (int w = 0; w < width; w++)
+        uchar *pcuSrc1;
+        uchar *pcuSrc2;
+        uchar *pcuDst;
+        uchar *pDst = new uchar[width * height];
+
+        (cudaMalloc((void **)&pcuSrc1, width * height * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuSrc2, width * height * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuDst, width * height * sizeof(uchar)));
+
+        (cudaMemcpy(pcuSrc1, src1.data, width * height * sizeof(uchar), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuSrc2, src2.data, width * height * sizeof(uchar), cudaMemcpyHostToDevice));
+
+        gpu_AddFrame(pcuSrc1, pcuSrc2, pcuDst, width, height);
+
+        (cudaMemcpy(pDst, pcuDst, width * height * sizeof(uchar), cudaMemcpyDeviceToHost));
+
+        dst = Mat(height, width, CV_8UC1, pDst);
+
+        cudaFree(pcuSrc1);
+        cudaFree(pcuSrc2);
+        cudaFree(pcuDst);
+    }
+    else
+    {
+        dst = Mat::zeros(height, width, 0);
+        // add task Pixel by Pixel
+        for (int h = 0; h < height; h++)
         {
-            dstPtr[w] = src1Ptr[w] + src2Ptr[w];
+            uchar *src1Ptr = src1.ptr<uchar>(h);
+            uchar *src2Ptr = src2.ptr<uchar>(h);
+            uchar *dstPtr = dst.ptr<uchar>(h);
+            for (int w = 0; w < width; w++)
+            {
+                dstPtr[w] = src1Ptr[w] + src2Ptr[w];
+            }
         }
     }
-
     return dst;
 }
 
@@ -396,15 +442,8 @@ Mat LaneDetection::SlidingWindow(Mat src)
         }
 
         // if there is no lane, 5 grid will search the lane
-        if (leftFind == false)
-            left_grid = 5;
-        else
-            left_grid = 3;
-
-        if (rightFind == false)
-            right_grid = 5;
-        else
-            right_grid = 3;
+        left_grid = (leftFind == false) ? 5 : 3;
+        right_grid = (rightFind == false) ? 5 : 3;
 
         // left lane searching
         for (int left = 0; left < left_grid; left++)
@@ -449,14 +488,8 @@ Mat LaneDetection::SlidingWindow(Mat src)
         curRightGrid.y = curRightGrid.y - grid_size.height;
 
         // if there is no lane
-        if (left_score < 50000)
-            leftFind = false;
-        else
-            leftFind = true;
-        if (right_score < 50000)
-            rightFind = false;
-        else
-            rightFind = true;
+        leftFind = (left_score < 50000) ? false : true;
+        rightFind = (right_score < 50000) ? false : true;
     }
 
     return laneMask;
@@ -505,13 +538,29 @@ int LaneDetection::calcGridScore(Mat src, Point grid, Size grid_size)
     int width = grid_size.width;
     int height = grid_size.height;
 
-    // Add every Pixel's value in each grid
-    for (int h = 0; h < height; h++)
+    if (with_cuda)
     {
-        uchar *ptr = src.ptr<uchar>(grid.y + h);
-        for (int w = 0; w < width; w++)
+        // Add every Pixel's value in each grid
+#pragma omp parallel for num_threads(2)
+        for (int h = 0; h < height; h++)
         {
-            score += (int)ptr[grid.x + w];
+            uchar *ptr = src.ptr<uchar>(grid.y + h);
+            for (int w = 0; w < width; w++)
+            {
+                score += (int)ptr[grid.x + w];
+            }
+        }
+    }
+    else
+    {
+        // Add every Pixel's value in each grid
+        for (int h = 0; h < height; h++)
+        {
+            uchar *ptr = src.ptr<uchar>(grid.y + h);
+            for (int w = 0; w < width; w++)
+            {
+                score += (int)ptr[grid.x + w];
+            }
         }
     }
 
@@ -549,20 +598,46 @@ Mat LaneDetection::maskingLane(Mat src, Mat lane)
 {
     int width = src.cols;
     int height = src.rows;
+    int channel = src.channels();
+    Mat dst = src.clone();
 
-    for (int h = 0; h < height; h++)
+    if (with_cuda)
     {
-        Vec3b *lanePtr = lane.ptr<Vec3b>(h);
-        Vec3b *srcPtr = src.ptr<Vec3b>(h);
-        for (int w = 0; w < width; w++)
+        uchar *pcuSrc;
+        uchar *pcuLane;
+        uchar *pDst = new uchar[width * height * channel];
+
+        (cudaMalloc((void **)&pcuSrc, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuLane, width * height * channel * sizeof(uchar)));
+
+        (cudaMemcpy(pcuSrc, src.data, width * height * channel * sizeof(uchar), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuLane, lane.data, width * height * channel * sizeof(uchar), cudaMemcpyHostToDevice));
+
+        gpu_MaskingLane(pcuSrc, pcuLane, width, height, channel);
+
+        (cudaMemcpy(pDst, pcuSrc, width * height * channel * sizeof(uchar), cudaMemcpyDeviceToHost));
+
+        dst = Mat(height, width, CV_8UC3, pDst);
+
+        cudaFree(pcuSrc);
+        cudaFree(pcuLane);
+    }
+    else
+    {
+        for (int h = 0; h < height; h++)
         {
-            if (lanePtr[w] != Vec3b(0, 0, 0))
+            Vec3b *lanePtr = lane.ptr<Vec3b>(h);
+            Vec3b *dstPtr = dst.ptr<Vec3b>(h);
+            for (int w = 0; w < width; w++)
             {
-                srcPtr[w] = lanePtr[w];
+                if (lanePtr[w] != Vec3b(0, 0, 0))
+                {
+                    dstPtr[w] = lanePtr[w];
+                }
             }
         }
     }
-    return src;
+    return dst;
 }
 LaneDetection::~LaneDetection()
 {

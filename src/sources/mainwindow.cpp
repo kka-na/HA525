@@ -1,25 +1,13 @@
 #include "mainwindow.h"
 
 #include <iostream>
-#include <memory>
-#include <fstream>
 #include <string>
-#include <unistd.h>
-#include <algorithm>
 
 #include <QCoreApplication>
-#include <QListWidgetItem>
-#include <QMessageBox>
 #include <QFileDialog>
-#include <QInputDialog>
-#include <QFile>
-#include <QDir>
-#include <QDebug>
 #include <QThread>
 #include <QTimer>
-#include <QMetaType>
-#include <QStorageInfo>
-#include <QtCharts>
+#include <QRadioButton>
 
 using namespace std;
 
@@ -43,6 +31,7 @@ void MainWindow::setFunction()
 	connect(ui->startButton, SIGNAL(clicked()), this, SLOT(setStart()));
 	connect(ui->stopButton, SIGNAL(clicked()), this, SLOT(setStop()));
 	connect(ui->actionAbout_HA525, SIGNAL(triggered()), this, SLOT(setAbout()));
+	connect(ui->radioButton, SIGNAL(clicked(bool)), this, SLOT(updateCUDA(bool)));
 
 	connect(ld, SIGNAL(sendDuration(int)), this, SLOT(setSlider(int)));
 	connect(ld, SIGNAL(sendImage(QImage, int)), this, SLOT(setImage(QImage, int)));
@@ -69,6 +58,14 @@ void MainWindow::updateSlider()
 {
 	sec += 1;
 	ui->horizontalSlider->setValue(sec);
+}
+
+void MainWindow::updateCUDA(bool checked)
+{
+	if (checked)
+		ld->with_cuda = true;
+	else
+		ld->with_cuda = false;
 }
 
 void MainWindow::setDisplay()
@@ -106,7 +103,6 @@ void MainWindow::setStop()
 	ld->running = false;
 	ld->connect = false;
 	ld->first_cnt = true;
-	pTimer->stop();
 	ui->horizontalSlider->setValue(0);
 	this->sec = 0;
 	for (int i = 0; i < 8; i++)
@@ -116,6 +112,7 @@ void MainWindow::setStop()
 		label->clear();
 		labelFPS->clear();
 	}
+	ui->labelTime->clear();
 	this->setDisplay();
 }
 

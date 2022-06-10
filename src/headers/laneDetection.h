@@ -11,6 +11,10 @@
 
 #include <string>
 
+void gpu_ColorFilter(uchar *, uchar *, int, int, int);
+void gpu_AddFrame(uchar *, uchar *, uchar *, int, int);
+void gpu_MaskingLane(uchar *, uchar *, int, int, int);
+
 class LaneDetection : public QThread
 {
     Q_OBJECT
@@ -22,6 +26,7 @@ public:
 public:
     void setStart();
     std::string data_path;
+    bool with_cuda = false;
     bool running = true;
     bool connect = false;
     bool first_cnt = true;

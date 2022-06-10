@@ -8,11 +8,7 @@
 
 #include <QMainWindow>
 #include <QObject>
-#include <QWidget>
 #include <QLabel>
-#include <QString>
-#include <QVector>
-#include <QStringList>
 
 #include "aboutwindow.h"
 
@@ -36,7 +32,6 @@ private:
     class LaneDetection::LaneDetection *ld;
 
     QImage detailImg;
-    QTimer *pTimer;
     int sec = 0;
 
     std::string data_path;
@@ -46,6 +41,7 @@ private:
     QLabel *getLabel(int, int);
 
 private slots:
+    void updateCUDA(bool);
     void setAbout();
     void setSlider(int);
     void updateSlider();

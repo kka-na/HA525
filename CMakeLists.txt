@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-
-project(pip)
+cmake_policy(SET CMP0104 OLD)
+project(pip LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
@@ -28,6 +28,12 @@ link_libraries(${JSONCPP_LIBRARIES})
 find_package (OpenCV REQUIRED PATHS ${OpenCV_DIR})
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+find_package(OpenMP REQUIRED)
+
+
+include_directories(/usr/local/cuda-11.4/samples/common/inc /usr/local/cuda-11.4/include)
+
+
 include_directories(src src/resource src/forms src/headers src/sources)
 
 set(HEADERS
@@ -41,6 +47,7 @@ set(SOURCE_pip
     src/sources/aboutwindow.cpp
     src/sources/main.cpp 
     src/sources/laneDetection.cpp
+    src/sources/kernel.cu
 )
 
 qt5_wrap_cpp(HEADER_pip ${HEADERS})
@@ -53,6 +60,6 @@ add_executable(pip
 )
 
 
-target_link_libraries(pip ${OpenCV_LIBRARIES} 
+target_link_libraries(pip ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX
     Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Charts Qt5::OpenGL
 )
