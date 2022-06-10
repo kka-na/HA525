@@ -47,7 +47,7 @@ void MainWindow::setFunction()
 	connect(ld, SIGNAL(sendDuration(int)), this, SLOT(setSlider(int)));
 	connect(ld, SIGNAL(sendImage(QImage, int)), this, SLOT(setImage(QImage, int)));
 	connect(ld, SIGNAL(sendFPS(int, int)), this, SLOT(setFPS(int, int)));
-	connect(ld, SIGNAL(startSlider()), this, SLOT(startSlider()));
+	connect(ld, SIGNAL(updateSlider()), this, SLOT(updateSlider()));
 }
 
 void MainWindow::setAbout()
@@ -62,20 +62,13 @@ void MainWindow::setSlider(int duration)
 	ui->horizontalSlider->setRange(0, duration);
 	ui->horizontalSlider->setSingleStep(1);
 	ui->labelTime->setText(QString::number(duration).append(" sec"));
-}
-
-void MainWindow::startSlider()
-{
-	pTimer = new QTimer(this);
 	sec = 0;
-	connect(pTimer, SIGNAL(timeout()), this, SLOT(updateSlider()));
-	pTimer->start(1000);
 }
 
 void MainWindow::updateSlider()
 {
-	ui->horizontalSlider->setValue(sec);
 	sec += 1;
+	ui->horizontalSlider->setValue(sec);
 }
 
 void MainWindow::setDisplay()

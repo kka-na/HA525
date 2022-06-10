@@ -48,7 +48,6 @@ private:
 private slots:
     void setAbout();
     void setSlider(int);
-    void startSlider();
     void updateSlider();
     void setDisplay();
     void setOpen();
