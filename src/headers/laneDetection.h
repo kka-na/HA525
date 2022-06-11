@@ -14,6 +14,8 @@
 void gpu_ColorFilter(uchar *, uchar *, int, int, int);
 void gpu_AddFrame(uchar *, uchar *, uchar *, int, int);
 void gpu_MaskingLane(uchar *, uchar *, int, int, int);
+void gpu_PerspectiveTransform(uchar *, uchar *, double *, double *, int, int, int);
+void gpu_ScharrFilter(uchar *, uchar *, uchar *, int, int);
 
 class LaneDetection : public QThread
 {
@@ -36,8 +38,8 @@ private:
     int sleep_cnt = 33;
 
     int searchingPoint[2] = {0, 0};
-    int upX_diff = 90;
-    int upY_diff = 150;
+    int upX_diff = 70;
+    int upY_diff = 110;
     int downX_diff = 380;
     int downY_diff = 100;
     int dstX = 0;
@@ -53,16 +55,16 @@ private:
     QImage convert2QT(cv::Mat);
     void emitProcesses(cv::Mat, std::chrono::high_resolution_clock::time_point, int);
 
-    cv::Mat BirdEyeViewTransform(cv::Mat);
-    cv::Mat myPerspectiveTransform(cv::Mat, std::vector<cv::Point2f>, std::vector<cv::Point2f>);
+    cv::Mat BirdEyeViewTransform(cv::Mat, cv::Mat);
     cv::Mat ScharrFilter(cv::Mat);
     cv::Mat ColorFilter(cv::Mat);
     cv::Mat addFrame(cv::Mat, cv::Mat);
     cv::Mat SlidingWindow(cv::Mat);
     cv::Point FindStartIndex(cv::Mat);
     int calcGridScore(cv::Mat, cv::Point, cv::Size);
-    cv::Mat InvBirdEyeViewTransform(cv::Mat);
+    cv::Mat InvBirdEyeViewTransform(cv::Mat, cv::Mat);
     cv::Mat maskingLane(cv::Mat, cv::Mat);
+    cv::Mat getHomographyMatrix(cv::Mat);
 
 signals:
     void sendDuration(int);

@@ -35,12 +35,13 @@ void LaneDetection::startDetection()
     Mat frame;
 
     cap >> frame;
+    resize(frame, frame, Size(640, 480));
 
     int width = frame.cols;
     int height = frame.rows;
 
     Mat birdEyeView, scharrFiltered, colorFiltered, filtered, laneSearched, laneMask, final;
-    Mat temp, tempImg, perspMatrix;
+    Mat temp, tempImg;
 
     Point p1s = Point2f(width / 2 - upX_diff, height / 2 - upY_diff);
     Point p2s = Point2f(width / 2 + upX_diff, height / 2 - upY_diff);
@@ -55,35 +56,54 @@ void LaneDetection::startDetection()
     vector<Point2f> srcRectCoord = {p1s, p2s, p3s, p4s};
     vector<Point2f> dstRectCoord = {p1d, p2d, p3d, p4d};
 
+    Mat perspMatrix = getHomographyMatrix(frame);
+
     std::chrono::high_resolution_clock::time_point s = std::chrono::high_resolution_clock::now();
 
     int frame_cnt = 0;
     while (running)
     {
         cap >> frame; // 0
-
+        resize(frame, frame, Size(640, 480));
         if (frame.empty())
             break;
 
         emitProcesses(frame, s, 0);
 
         // some processing
-        birdEyeView = BirdEyeViewTransform(frame); // 1
+        birdEyeView = BirdEyeViewTransform(frame, perspMatrix); // 1
         emitProcesses(birdEyeView, s, 1);
 
-        scharrFiltered = ScharrFilter(birdEyeView); // 2
-        emitProcesses(scharrFiltered, s, 2);
-
-        colorFiltered = ColorFilter(birdEyeView); // 3
-        emitProcesses(colorFiltered, s, 3);
-
+        if (with_cuda)
+        {
+#pragma omp parallel sections num_threads(2)
+            {
+#pragma omp section
+                {
+                    scharrFiltered = ScharrFilter(birdEyeView); // 2
+                    emitProcesses(scharrFiltered, s, 2);
+                }
+#pragma omp section
+                {
+                    colorFiltered = ColorFilter(birdEyeView); // 3
+                    emitProcesses(colorFiltered, s, 3);
+                }
+            }
+        }
+        else
+        {
+            scharrFiltered = ScharrFilter(birdEyeView); // 2
+            emitProcesses(scharrFiltered, s, 2);
+            colorFiltered = ColorFilter(birdEyeView); // 3
+            emitProcesses(colorFiltered, s, 3);
+        }
         filtered = addFrame(scharrFiltered, colorFiltered); // 4
         emitProcesses(filtered, s, 4);
 
         laneSearched = SlidingWindow(filtered); // 5
         emitProcesses(laneSearched, s, 5);
 
-        laneMask = InvBirdEyeViewTransform(laneSearched); // 6
+        laneMask = InvBirdEyeViewTransform(laneSearched, perspMatrix); // 6
         emitProcesses(laneMask, s, 6);
 
         final = maskingLane(frame, laneMask); // 7
@@ -121,102 +141,132 @@ void LaneDetection::emitProcesses(Mat frame, std::chrono::high_resolution_clock:
 }
 
 // Perspective Transform using OpenCV
-Mat LaneDetection::BirdEyeViewTransform(Mat src)
-{
-    Mat perspMatrix, dst;
-    int width = src.cols;
-    int height = src.rows;
-    vector<Point2f> srcRectCoord, dstRectCoord;
-
-    // Source Point
-    Point p1s = Point2f(width / 2 - upX_diff, height / 2 - upY_diff);
-    Point p2s = Point2f(width / 2 + upX_diff, height / 2 - upY_diff);
-    Point p3s = Point2f(width / 2 - downX_diff, height / 2 + downY_diff);
-    Point p4s = Point2f(width / 2 + downX_diff, height / 2 + downY_diff);
-
-    // Destination Point
-    Point p1d = Point2f(dstX, 0);
-    Point p2d = Point2f(width - dstX, 0);
-    Point p3d = Point2f(dstX, height);
-    Point p4d = Point2f(width - dstX, height);
-
-    srcRectCoord = {p1s, p2s, p3s, p4s};
-    dstRectCoord = {p1d, p2d, p3d, p4d};
-
-    // get 3X3 Homographic Matrix
-    perspMatrix = getPerspectiveTransform(srcRectCoord, dstRectCoord);
-
-    // Perspective Transform
-    warpPerspective(src, dst, perspMatrix, Size(width, height), INTER_LINEAR);
-
-    return dst;
-}
-
-// Perspective Transform
-Mat LaneDetection::myPerspectiveTransform(Mat src, vector<Point2f> srcRectCoord, vector<Point2f> dstRectCoord)
+Mat LaneDetection::BirdEyeViewTransform(Mat src, Mat perspMatrix)
 {
     Mat dst = Mat::zeros(src.size(), src.type());
     int width = src.cols;
     int height = src.rows;
-    float new_w, new_h;
+    int channel = src.channels();
 
-    // get Homographic Matrix
-    Mat perspMatrix = getPerspectiveTransform(srcRectCoord, dstRectCoord);
-
-    // get Inverse Homographic Matrix
     Mat invPerspMatrix = perspMatrix.inv();
 
-    float h_Matrix[] = {perspMatrix.at<float>(0), perspMatrix.at<float>(1), perspMatrix.at<float>(2),
-                        perspMatrix.at<float>(3), perspMatrix.at<float>(4), perspMatrix.at<float>(5),
-                        perspMatrix.at<float>(6), perspMatrix.at<float>(7), perspMatrix.at<float>(8)};
-
-    float h_Matrix_inv[] = {invPerspMatrix.at<float>(0), invPerspMatrix.at<float>(1), invPerspMatrix.at<float>(2),
-                            invPerspMatrix.at<float>(3), invPerspMatrix.at<float>(4), invPerspMatrix.at<float>(5),
-                            invPerspMatrix.at<float>(6), invPerspMatrix.at<float>(7), invPerspMatrix.at<float>(8)};
-
-    // Perspective Transform
-    for (int h = 0; h < height; h++)
+    if (with_cuda)
     {
-        Vec3b *srcPtr = src.ptr<Vec3b>(h);
-        for (int w = 0; w < width; w++)
+        uchar *pcuSrc;
+        uchar *pcuDst;
+        double *pcuMat_H;
+        double *pcuMat_H_Inv;
+        uchar *pDst = new uchar[width * height * channel];
+
+        (cudaMalloc((void **)&pcuSrc, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuDst, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuMat_H, 3 * 3 * sizeof(double)));
+        (cudaMalloc((void **)&pcuMat_H_Inv, 3 * 3 * sizeof(double)));
+
+        (cudaMemcpy(pcuSrc, src.data, width * height * channel * sizeof(uchar), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuMat_H, perspMatrix.data, 3 * 3 * sizeof(double), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuMat_H_Inv, invPerspMatrix.data, 3 * 3 * sizeof(double), cudaMemcpyHostToDevice));
+        gpu_PerspectiveTransform(pcuSrc, pcuDst, pcuMat_H, pcuMat_H_Inv, width, height, channel);
+        (cudaMemcpy(pDst, pcuDst, width * height * channel * sizeof(uchar), cudaMemcpyDeviceToHost));
+
+        dst = Mat(height, width, CV_8UC3, pDst);
+
+        cudaFree(pcuSrc);
+        cudaFree(pcuDst);
+        cudaFree(pcuMat_H);
+        cudaFree(pcuMat_H_Inv);
+    }
+    else
+    {
+        double new_w, new_h;
+
+        double h_Matrix[] = {perspMatrix.at<double>(0), perspMatrix.at<double>(1), perspMatrix.at<double>(2),
+
+                             perspMatrix.at<double>(3), perspMatrix.at<double>(4), perspMatrix.at<double>(5),
+
+                             perspMatrix.at<double>(6), perspMatrix.at<double>(7), perspMatrix.at<double>(8)};
+
+        double h_Matrix_inv[] = {invPerspMatrix.at<double>(0), invPerspMatrix.at<double>(1), invPerspMatrix.at<double>(2),
+
+                                 invPerspMatrix.at<double>(3), invPerspMatrix.at<double>(4), invPerspMatrix.at<double>(5),
+
+                                 invPerspMatrix.at<double>(6), invPerspMatrix.at<double>(7), invPerspMatrix.at<double>(8)};
+
+        // Perspective Transform
+
+        for (int h = 0; h < height; h++)
         {
-            new_w = (h_Matrix[0] * w + h_Matrix[1] * h + h_Matrix[2]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
-            new_h = (h_Matrix[3] * w + h_Matrix[4] * h + h_Matrix[5]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
-            if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
+
+            Vec3b *srcPtr = src.ptr<Vec3b>(h);
+
+            for (int w = 0; w < width; w++)
             {
-                Vec3b *dstPtr = dst.ptr<Vec3b>(new_h);
-                for (int k = 0; k < 3; k++)
+
+                new_w = (h_Matrix[0] * w + h_Matrix[1] * h + h_Matrix[2]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
+
+                new_h = (h_Matrix[3] * w + h_Matrix[4] * h + h_Matrix[5]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
+
+                if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
                 {
-                    dstPtr[(int)new_w][k] = srcPtr[w][k];
+
+                    Vec3b *dstPtr = dst.ptr<Vec3b>(new_h);
+
+                    for (int k = 0; k < 3; k++)
+                    {
+
+                        dstPtr[(int)new_w][k] = srcPtr[w][k];
+                    }
                 }
             }
         }
-    }
 
-    float a, b;
-    int i, j;
+        double a, b;
 
-    // Interpolation
-    for (int h = 0; h < height; h++)
-    {
-        Vec3b *dstPtr = dst.ptr<Vec3b>(h);
-        for (int w = 0; w < width; w++)
+        int i, j;
+
+        // Interpolation
+
+        for (int h = 0; h < height; h++)
         {
-            if (dstPtr[w] == Vec3b(0, 0, 0))
+
+            Vec3b *dstPtr = dst.ptr<Vec3b>(h);
+
+            for (int w = 0; w < width; w++)
             {
-                new_w = (h_Matrix_inv[0] * w + h_Matrix_inv[1] * h + h_Matrix_inv[2]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
-                new_h = (h_Matrix_inv[3] * w + h_Matrix_inv[4] * h + h_Matrix_inv[5]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
-                if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
+
+                if (dstPtr[w] == Vec3b(0, 0, 0))
                 {
-                    Vec3b *srcPtr1 = src.ptr<Vec3b>(new_h);
-                    Vec3b *srcPtr2 = src.ptr<Vec3b>(new_h + 1);
-                    i = new_w;
-                    j = new_h;
-                    a = new_w - i;
-                    b = new_h - j;
-                    for (int k = 0; k < 3; k++)
+
+                    new_w = (h_Matrix_inv[0] * w + h_Matrix_inv[1] * h + h_Matrix_inv[2]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
+
+                    new_h = (h_Matrix_inv[3] * w + h_Matrix_inv[4] * h + h_Matrix_inv[5]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
+
+                    if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
                     {
-                        dstPtr[w][k] = (1 - a) * (1 - b) * srcPtr1[i][k] + a * (1 - b) * srcPtr1[i + 1][k] + a * b * srcPtr2[i + 1][k] + (1 - a) * b * srcPtr2[i][k];
+
+                        Vec3b *srcPtr1 = src.ptr<Vec3b>(new_h);
+
+                        Vec3b *srcPtr2 = src.ptr<Vec3b>(new_h + 1);
+
+                        i = new_w;
+
+                        j = new_h;
+
+                        a = new_w - i;
+
+                        b = new_h - j;
+
+                        for (int k = 0; k < 3; k++)
+                        {
+
+                            dstPtr[w][k] = (1 - a) * (1 - b) * srcPtr1[i][k]
+
+                                           + a * (1 - b) * srcPtr1[i + 1][k]
+
+                                           + a * b * srcPtr2[i + 1][k]
+
+                                           + (1 - a) * b * srcPtr2[i][k];
+                        }
                     }
                 }
             }
@@ -231,52 +281,77 @@ Mat LaneDetection::ScharrFilter(Mat src)
 {
     int width = src.cols;
     int height = src.rows;
-    Mat src_gray;
+    Mat graySrc;
+    cvtColor(src, graySrc, COLOR_BGR2GRAY);
+    Mat zeroPad = Mat::zeros(height + 2, width + 2, graySrc.type());
+    Mat dst = Mat::zeros(height, width, graySrc.type());
 
-    cvtColor(src, src_gray, COLOR_BGR2GRAY);
-
-    Mat zeroPad = Mat::zeros(height + 2, width + 2, src_gray.type());
-    Mat zeroPadDst = Mat::zeros(height, width, src_gray.type());
-
-    // Zeropadding
-    for (int h = 0; h < height; h++)
+    if (with_cuda)
     {
-        uchar *zPadPtr = zeroPad.ptr<uchar>(h + 1);
-        uchar *srcPtr = src_gray.ptr<uchar>(h);
-        for (int w = 0; w < width; w++)
+        uchar *pcuSrc;
+        uchar *zPadSrc;
+        uchar *pcuDst;
+        uchar *pDst = new uchar[width * height];
+
+        (cudaMalloc((void **)&pcuSrc, width * height * sizeof(uchar)));
+        (cudaMalloc((void **)&zPadSrc, (width + 2) * (height + 2) * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuDst, width * height * sizeof(uchar)));
+
+        (cudaMemcpy(pcuSrc, graySrc.data, width * height * sizeof(uchar), cudaMemcpyHostToDevice));
+        (cudaMemcpy(zPadSrc, zeroPad.data, (width + 2) * (height + 2) * sizeof(uchar), cudaMemcpyHostToDevice));
+
+        gpu_ScharrFilter(pcuSrc, zPadSrc, pcuDst, width, height);
+
+        (cudaMemcpy(pDst, pcuDst, width * height * sizeof(uchar), cudaMemcpyDeviceToHost));
+
+        dst = Mat(height, width, CV_8UC1, pDst);
+
+        cudaFree(pcuSrc);
+        cudaFree(zPadSrc);
+        cudaFree(pcuDst);
+    }
+    else
+    {
+        // Zeropadding
+        for (int h = 0; h < height; h++)
         {
-            zPadPtr[w + 1] = srcPtr[w];
+            uchar *zPadPtr = zeroPad.ptr<uchar>(h + 1);
+            uchar *srcPtr = graySrc.ptr<uchar>(h);
+            for (int w = 0; w < width; w++)
+            {
+                zPadPtr[w + 1] = srcPtr[w];
+            }
+        }
+
+        float scharrFilter_x[] = {3, 10, 3, 0, 0, 0, -3, -10, -3};
+        float scharrFilter_y[] = {3, 0, -3, 10, 0, -10, 3, 0, -3};
+
+        // Convolution
+        for (int h = 1; h < height + 1; h++)
+        {
+            uchar *zPadPtr_1 = zeroPad.ptr<uchar>(h - 1);
+            uchar *zPadPtr_2 = zeroPad.ptr<uchar>(h);
+            uchar *zPadPtr_3 = zeroPad.ptr<uchar>(h + 1);
+            uchar *zPadDstPrt = dst.ptr<uchar>(h - 1);
+            for (int w = 1; w < width + 1; w++)
+            {
+                int sum = 0;
+                // int idx = 0;
+                sum = zPadPtr_1[w - 1] * scharrFilter_x[0] + zPadPtr_1[w] * scharrFilter_x[1] + zPadPtr_1[w + 1] * scharrFilter_x[2] + zPadPtr_2[w - 1] * scharrFilter_x[3] + zPadPtr_2[w] * scharrFilter_x[4] + zPadPtr_2[w + 1] * scharrFilter_x[5] + zPadPtr_3[w - 1] * scharrFilter_x[6] + zPadPtr_3[w] * scharrFilter_x[7] + zPadPtr_3[w + 1] * scharrFilter_x[8] + zPadPtr_1[w - 1] * scharrFilter_y[0] + zPadPtr_1[w] * scharrFilter_y[1] + zPadPtr_1[w + 1] * scharrFilter_y[2] + zPadPtr_2[w - 1] * scharrFilter_y[3] + zPadPtr_2[w] * scharrFilter_y[4] + zPadPtr_2[w + 1] * scharrFilter_y[5] + zPadPtr_3[w - 1] * scharrFilter_y[6] + zPadPtr_3[w] * scharrFilter_y[7] + zPadPtr_3[w + 1] * scharrFilter_y[8];
+                if (sum < 0)
+                    sum = (-1) * sum;
+                if (sum > 255)
+                    sum = 255;
+                if (sum < 150)
+                    sum = 0;
+                else
+                    sum = 255;
+                zPadDstPrt[w - 1] = (uchar)sum;
+            }
         }
     }
 
-    float scharrFilter_x[] = {3, 10, 3, 0, 0, 0, -3, -10, -3};
-    float scharrFilter_y[] = {3, 0, -3, 10, 0, -10, 3, 0, -3};
-
-    // Convolution
-    for (int h = 1; h < height + 1; h++)
-    {
-        uchar *zPadPtr_1 = zeroPad.ptr<uchar>(h - 1);
-        uchar *zPadPtr_2 = zeroPad.ptr<uchar>(h);
-        uchar *zPadPtr_3 = zeroPad.ptr<uchar>(h + 1);
-        uchar *zPadDstPrt = zeroPadDst.ptr<uchar>(h - 1);
-        for (int w = 1; w < width + 1; w++)
-        {
-            int sum = 0;
-            // int idx = 0;
-            sum = zPadPtr_1[w - 1] * scharrFilter_x[0] + zPadPtr_1[w] * scharrFilter_x[1] + zPadPtr_1[w + 1] * scharrFilter_x[2] + zPadPtr_2[w - 1] * scharrFilter_x[3] + zPadPtr_2[w] * scharrFilter_x[4] + zPadPtr_2[w + 1] * scharrFilter_x[5] + zPadPtr_3[w - 1] * scharrFilter_x[6] + zPadPtr_3[w] * scharrFilter_x[7] + zPadPtr_3[w + 1] * scharrFilter_x[8] + zPadPtr_1[w - 1] * scharrFilter_y[0] + zPadPtr_1[w] * scharrFilter_y[1] + zPadPtr_1[w + 1] * scharrFilter_y[2] + zPadPtr_2[w - 1] * scharrFilter_y[3] + zPadPtr_2[w] * scharrFilter_y[4] + zPadPtr_2[w + 1] * scharrFilter_y[5] + zPadPtr_3[w - 1] * scharrFilter_y[6] + zPadPtr_3[w] * scharrFilter_y[7] + zPadPtr_3[w + 1] * scharrFilter_y[8];
-            if (sum < 0)
-                sum = (-1) * sum;
-            if (sum > 255)
-                sum = 255;
-            if (sum < 150)
-                sum = 0;
-            else
-                sum = 255;
-            zPadDstPrt[w - 1] = (uchar)sum;
-        }
-    }
-
-    return zeroPadDst;
+    return dst;
 }
 
 // Color Filtering
@@ -419,77 +494,169 @@ Mat LaneDetection::SlidingWindow(Mat src)
     Point curLeftGrid = Point2i(searchingPoint[0], height - grid_size.height);
     Point curRightGrid = Point2i(searchingPoint[1], height - grid_size.height);
     Point nextLeftGrid, nextRightGrid;
-    Point targetGrid;
+    Point left_targetGrid, right_targetGrid;
 
     int left_score;
     int right_score;
-    int score_temp;
+    int score_left_temp, score_right_temp;
 
     bool leftFind = true;
     bool rightFind = true;
 
-    // Start Searching from the bottom of the frame to the top of the frame
-    for (int i = 0; i < gridY_number; i++)
+    if (with_cuda)
     {
-        left_score = 0;
-        right_score = 0;
-
-        // Searching Point of Next Frame
-        if (i == 2)
+// Start Searching from the bottom of the frame to the top of the frame
+#pragma omp parallel sections num_threads(2)
         {
-            searchingPoint[0] = curLeftGrid.x;
-            searchingPoint[1] = curRightGrid.x;
-        }
-
-        // if there is no lane, 5 grid will search the lane
-        left_grid = (leftFind == false) ? 5 : 3;
-        right_grid = (rightFind == false) ? 5 : 3;
-
-        // left lane searching
-        for (int left = 0; left < left_grid; left++)
-        {
-            targetGrid = Point(curLeftGrid.x + (left - (left_grid / 2)) * grid_size.width, curLeftGrid.y);
-            if (0 <= targetGrid.x && targetGrid.x + grid_size.width <= width && 0 <= targetGrid.y && targetGrid.y + grid_size.height <= height)
+#pragma omp section
             {
-                // Calculate each grid's score
-                score_temp = calcGridScore(src, targetGrid, grid_size);
-                if (left_score < score_temp)
+
+                for (int i = 0; i < gridY_number; i++)
                 {
-                    left_score = score_temp;
-                    nextLeftGrid = targetGrid;
+                    left_score = 0;
+                    score_left_temp = 0;
+
+                    // Searching Point of Next Frame
+                    if (i == 2)
+                        searchingPoint[0] = curLeftGrid.x;
+
+                    // if there is no lane, 5 grid will search the lane
+                    left_grid = (leftFind == false) ? 5 : 3;
+
+                    // left lane searching
+                    for (int left = 0; left < left_grid; left++)
+                    {
+                        left_targetGrid = Point(curLeftGrid.x + (left - (left_grid / 2)) * grid_size.width, curLeftGrid.y);
+                        if (0 <= left_targetGrid.x && left_targetGrid.x + grid_size.width <= width && 0 <= left_targetGrid.y && left_targetGrid.y + grid_size.height <= height)
+                        {
+                            // Calculate each grid's score
+                            score_left_temp = calcGridScore(src, left_targetGrid, grid_size);
+                            if (left_score < score_left_temp)
+                            {
+                                left_score = score_left_temp;
+                                nextLeftGrid = left_targetGrid;
+                            }
+                            rectangle(laneMask, Rect(left_targetGrid.x, left_targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), 2);
+                        }
+                    }
+                    if (left_score > 50000)
+                        rectangle(laneMask, Rect(nextLeftGrid.x, left_targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), FILLED);
+                    curLeftGrid.x = nextLeftGrid.x;
+                    curLeftGrid.y = curLeftGrid.y - grid_size.height;
+                    leftFind = (left_score < 50000) ? false : true;
                 }
-                rectangle(laneMask, Rect(targetGrid.x, targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), 2);
+            }
+#pragma omp section
+            {
+                for (int i = 0; i < gridY_number; i++)
+                {
+                    right_score = 0;
+                    score_right_temp = 0;
+
+                    if (i == 2)
+                        searchingPoint[1] = curRightGrid.x;
+
+                    right_grid = (rightFind == false) ? 5 : 3;
+
+                    // right lane searching
+                    for (int right = 0; right < right_grid; right++)
+                    {
+                        right_targetGrid = Point(curRightGrid.x + (right - (right_grid / 2)) * grid_size.width, curRightGrid.y);
+                        if (0 <= right_targetGrid.x && right_targetGrid.x + grid_size.width <= width && 0 <= right_targetGrid.y && right_targetGrid.y + grid_size.height <= height)
+                        {
+                            // Calculate each grid's score
+                            score_right_temp = calcGridScore(src, right_targetGrid, grid_size);
+                            if (right_score < score_right_temp)
+                            {
+                                right_score = score_right_temp;
+                                nextRightGrid = right_targetGrid;
+                            }
+                            rectangle(laneMask, Rect(right_targetGrid.x, right_targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), 2);
+                        }
+                    }
+                    if (right_score > 50000)
+                        rectangle(laneMask, Rect(nextRightGrid.x, right_targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), FILLED);
+                    curRightGrid.x = nextRightGrid.x;
+                    curRightGrid.y = curRightGrid.y - grid_size.height;
+
+                    // if there is no lane
+                    rightFind = (right_score < 50000) ? false : true;
+                }
             }
         }
-        if (left_score > 50000)
-            rectangle(laneMask, Rect(nextLeftGrid.x, targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), FILLED);
-        curLeftGrid.x = nextLeftGrid.x;
-        curLeftGrid.y = curLeftGrid.y - grid_size.height;
-
-        // right lane searching
-        for (int right = 0; right < right_grid; right++)
+    }
+    else
+    {
+        // Start Searching from the bottom of the frame to the top of the frame
+        for (int i = 0; i < gridY_number; i++)
         {
-            targetGrid = Point(curRightGrid.x + (right - (right_grid / 2)) * grid_size.width, curRightGrid.y);
-            if (0 <= targetGrid.x && targetGrid.x + grid_size.width <= width && 0 <= targetGrid.y && targetGrid.y + grid_size.height <= height)
-            {
-                // Calculate each grid's score
-                score_temp = calcGridScore(src, targetGrid, grid_size);
-                if (right_score < score_temp)
-                {
-                    right_score = score_temp;
-                    nextRightGrid = targetGrid;
-                }
-                rectangle(laneMask, Rect(targetGrid.x, targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), 2);
-            }
-        }
-        if (right_score > 50000)
-            rectangle(laneMask, Rect(nextRightGrid.x, targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), FILLED);
-        curRightGrid.x = nextRightGrid.x;
-        curRightGrid.y = curRightGrid.y - grid_size.height;
+            left_score = 0;
+            score_left_temp = 0;
 
-        // if there is no lane
-        leftFind = (left_score < 50000) ? false : true;
-        rightFind = (right_score < 50000) ? false : true;
+            // Searching Point of Next Frame
+            if (i == 2)
+                searchingPoint[0] = curLeftGrid.x;
+
+            // if there is no lane, 5 grid will search the lane
+            left_grid = (leftFind == false) ? 5 : 3;
+
+            // left lane searching
+            for (int left = 0; left < left_grid; left++)
+            {
+                left_targetGrid = Point(curLeftGrid.x + (left - (left_grid / 2)) * grid_size.width, curLeftGrid.y);
+                if (0 <= left_targetGrid.x && left_targetGrid.x + grid_size.width <= width && 0 <= left_targetGrid.y && left_targetGrid.y + grid_size.height <= height)
+                {
+                    // Calculate each grid's score
+                    score_left_temp = calcGridScore(src, left_targetGrid, grid_size);
+                    if (left_score < score_left_temp)
+                    {
+                        left_score = score_left_temp;
+                        nextLeftGrid = left_targetGrid;
+                    }
+                    rectangle(laneMask, Rect(left_targetGrid.x, left_targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), 2);
+                }
+            }
+            if (left_score > 50000)
+                rectangle(laneMask, Rect(nextLeftGrid.x, left_targetGrid.y, grid_size.width, grid_size.height), Scalar(0, 0, 255), FILLED);
+            curLeftGrid.x = nextLeftGrid.x;
+            curLeftGrid.y = curLeftGrid.y - grid_size.height;
+            leftFind = (left_score < 50000) ? false : true;
+        }
+
+        for (int i = 0; i < gridY_number; i++)
+        {
+            right_score = 0;
+            score_right_temp = 0;
+
+            if (i == 2)
+                searchingPoint[1] = curRightGrid.x;
+
+            right_grid = (rightFind == false) ? 5 : 3;
+
+            // right lane searching
+            for (int right = 0; right < right_grid; right++)
+            {
+                right_targetGrid = Point(curRightGrid.x + (right - (right_grid / 2)) * grid_size.width, curRightGrid.y);
+                if (0 <= right_targetGrid.x && right_targetGrid.x + grid_size.width <= width && 0 <= right_targetGrid.y && right_targetGrid.y + grid_size.height <= height)
+                {
+                    // Calculate each grid's score
+                    score_right_temp = calcGridScore(src, right_targetGrid, grid_size);
+                    if (right_score < score_right_temp)
+                    {
+                        right_score = score_right_temp;
+                        nextRightGrid = right_targetGrid;
+                    }
+                    rectangle(laneMask, Rect(right_targetGrid.x, right_targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), 2);
+                }
+            }
+            if (right_score > 50000)
+                rectangle(laneMask, Rect(nextRightGrid.x, right_targetGrid.y, grid_size.width, grid_size.height), Scalar(255, 0, 0), FILLED);
+            curRightGrid.x = nextRightGrid.x;
+            curRightGrid.y = curRightGrid.y - grid_size.height;
+
+            // if there is no lane
+            rightFind = (right_score < 50000) ? false : true;
+        }
     }
 
     return laneMask;
@@ -567,29 +734,137 @@ int LaneDetection::calcGridScore(Mat src, Point grid, Size grid_size)
     return score;
 }
 
-Mat LaneDetection::InvBirdEyeViewTransform(Mat src)
+Mat LaneDetection::InvBirdEyeViewTransform(Mat src, Mat perspMatrix)
 {
-    Mat perspMatrix, dst;
+    Mat dst = Mat::zeros(src.size(), src.type());
     int width = src.cols;
     int height = src.rows;
-    vector<Point2f> srcRectCoord, dstRectCoord;
+    int channel = src.channels();
 
-    Point p1s = Point2f(dstX, 0);
-    Point p2s = Point2f(width - dstX, 0);
-    Point p3s = Point2f(dstX, height);
-    Point p4s = Point2f(width - dstX, height);
+    Mat invPerspMatrix = perspMatrix.inv();
 
-    Point p1d = Point2f(width / 2 - upX_diff, height / 2 - upY_diff);
-    Point p2d = Point2f(width / 2 + upX_diff, height / 2 - upY_diff);
-    Point p3d = Point2f(width / 2 - downX_diff, height / 2 + downY_diff);
-    Point p4d = Point2f(width / 2 + downX_diff, height / 2 + downY_diff);
+    if (with_cuda)
+    {
 
-    srcRectCoord = {p1s, p2s, p3s, p4s};
-    dstRectCoord = {p1d, p2d, p3d, p4d};
+        uchar *pcuSrc;
+        uchar *pcuDst;
+        double *pcuMat_H;
+        double *pcuMat_H_Inv;
+        uchar *pDst = new uchar[width * height * channel];
 
-    perspMatrix = getPerspectiveTransform(srcRectCoord, dstRectCoord);
-    warpPerspective(src, dst, perspMatrix, Size(width, height), INTER_LINEAR);
+        (cudaMalloc((void **)&pcuSrc, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuDst, width * height * channel * sizeof(uchar)));
+        (cudaMalloc((void **)&pcuMat_H, 3 * 3 * sizeof(double)));
+        (cudaMalloc((void **)&pcuMat_H_Inv, 3 * 3 * sizeof(double)));
 
+        (cudaMemcpy(pcuSrc, src.data, width * height * channel * sizeof(uchar), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuMat_H, perspMatrix.data, 3 * 3 * sizeof(double), cudaMemcpyHostToDevice));
+        (cudaMemcpy(pcuMat_H_Inv, invPerspMatrix.data, 3 * 3 * sizeof(double), cudaMemcpyHostToDevice));
+        gpu_PerspectiveTransform(pcuSrc, pcuDst, pcuMat_H_Inv, pcuMat_H, width, height, channel);
+        (cudaMemcpy(pDst, pcuDst, width * height * channel * sizeof(uchar), cudaMemcpyDeviceToHost));
+
+        dst = Mat(height, width, CV_8UC3, pDst);
+
+        cudaFree(pcuSrc);
+        cudaFree(pcuDst);
+        cudaFree(pcuMat_H);
+        cudaFree(pcuMat_H_Inv);
+    }
+    else
+    {
+        double new_w, new_h;
+        double h_Matrix[] = {invPerspMatrix.at<double>(0), invPerspMatrix.at<double>(1), invPerspMatrix.at<double>(2),
+
+                             invPerspMatrix.at<double>(3), invPerspMatrix.at<double>(4), invPerspMatrix.at<double>(5),
+
+                             invPerspMatrix.at<double>(6), invPerspMatrix.at<double>(7), invPerspMatrix.at<double>(8)};
+
+        double h_Matrix_inv[] = {perspMatrix.at<double>(0), perspMatrix.at<double>(1), perspMatrix.at<double>(2),
+
+                                 perspMatrix.at<double>(3), perspMatrix.at<double>(4), perspMatrix.at<double>(5),
+
+                                 perspMatrix.at<double>(6), perspMatrix.at<double>(7), perspMatrix.at<double>(8)};
+
+        // Perspective Transform
+
+        for (int h = 0; h < height; h++)
+        {
+
+            Vec3b *srcPtr = src.ptr<Vec3b>(h);
+
+            for (int w = 0; w < width; w++)
+            {
+
+                new_w = (h_Matrix[0] * w + h_Matrix[1] * h + h_Matrix[2]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
+
+                new_h = (h_Matrix[3] * w + h_Matrix[4] * h + h_Matrix[5]) / (h_Matrix[6] * w + h_Matrix[7] * h + h_Matrix[8]);
+
+                if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
+                {
+
+                    Vec3b *dstPtr = dst.ptr<Vec3b>(new_h);
+
+                    for (int k = 0; k < 3; k++)
+                    {
+
+                        dstPtr[(int)new_w][k] = srcPtr[w][k];
+                    }
+                }
+            }
+        }
+
+        double a, b;
+
+        int i, j;
+
+        // Interpolation
+
+        for (int h = 0; h < height; h++)
+        {
+
+            Vec3b *dstPtr = dst.ptr<Vec3b>(h);
+
+            for (int w = 0; w < width; w++)
+            {
+
+                if (dstPtr[w] == Vec3b(0, 0, 0))
+                {
+
+                    new_w = (h_Matrix_inv[0] * w + h_Matrix_inv[1] * h + h_Matrix_inv[2]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
+
+                    new_h = (h_Matrix_inv[3] * w + h_Matrix_inv[4] * h + h_Matrix_inv[5]) / (h_Matrix_inv[6] * w + h_Matrix_inv[7] * h + h_Matrix_inv[8]);
+
+                    if (0 <= new_h && new_h < height && 0 <= new_w && new_w < width)
+                    {
+
+                        Vec3b *srcPtr1 = src.ptr<Vec3b>(new_h);
+
+                        Vec3b *srcPtr2 = src.ptr<Vec3b>(new_h + 1);
+
+                        i = new_w;
+
+                        j = new_h;
+
+                        a = new_w - i;
+
+                        b = new_h - j;
+
+                        for (int k = 0; k < 3; k++)
+                        {
+
+                            dstPtr[w][k] = (1 - a) * (1 - b) * srcPtr1[i][k]
+
+                                           + a * (1 - b) * srcPtr1[i + 1][k]
+
+                                           + a * b * srcPtr2[i + 1][k]
+
+                                           + (1 - a) * b * srcPtr2[i][k];
+                        }
+                    }
+                }
+            }
+        }
+    }
     return dst;
 }
 
@@ -639,6 +914,34 @@ Mat LaneDetection::maskingLane(Mat src, Mat lane)
     }
     return dst;
 }
+
+Mat LaneDetection::getHomographyMatrix(Mat src)
+{
+    int width = src.cols;
+    int height = src.rows;
+
+    vector<Point2f> srcRectCoord, dstRectCoord;
+
+    // Source Point
+    Point p1s = Point2f(width / 2 - upX_diff, height / 2 - upY_diff);
+    Point p2s = Point2f(width / 2 + upX_diff, height / 2 - upY_diff);
+    Point p3s = Point2f(width / 2 - downX_diff, height / 2 + downY_diff);
+    Point p4s = Point2f(width / 2 + downX_diff, height / 2 + downY_diff);
+
+    // Destination Point
+    Point p1d = Point2f(dstX, 0);
+    Point p2d = Point2f(width - dstX, 0);
+    Point p3d = Point2f(dstX, height);
+    Point p4d = Point2f(width - dstX, height);
+
+    srcRectCoord = {p1s, p2s, p3s, p4s};
+    dstRectCoord = {p1d, p2d, p3d, p4d};
+
+    // get Homographic Matrix
+    Mat perspMatrix = getPerspectiveTransform(srcRectCoord, dstRectCoord);
+    return perspMatrix;
+}
+
 LaneDetection::~LaneDetection()
 {
 }
